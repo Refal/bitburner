@@ -4,8 +4,8 @@ export async function main(ns) {
   //just pring available servers for hacking
   //todo uncomment after purchasing formula.exe
   //ns.run("target_analyzer.js",1, 20)
-  //share trading
-  ns.run("long-short-trader-ui.js", 1, 1e12)
+  //share trading did not spent time to improve for publish
+ // ns.run("long-short-trader-ui.js", 1, 1e12)
    //1,  money that need to be keepd - update myserver fleet
   ns.run("share_manage.js", 1, 1e12)
   

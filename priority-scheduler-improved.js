@@ -3,7 +3,7 @@ const debug = false;
 // ---- Global Settings ----
 const BATCH_WINDOW_MS = 200;    // Minimum allowed gap between phases (safe value)
 const BASE_OFFSET = 200;        // Time between launches of consecutive batches per target (should be >= BATCH_WINDOW_MS)
-const BATCH_PAUSE = 5000;   // pause between planning cycles
+const BATCH_PAUSE = 3000;   // pause between planning cycles
 const OFFEST_MAX_TRIES = Math.ceil(BATCH_PAUSE / BATCH_WINDOW_MS) - 1 // we can try to fill a whole pause window - one BATCH_WINDOW gap
 // ---- Global Window Tracker ----
 const batchWindows = {}; // { [target]: [ { hack:ms, grow:ms, weakenH:ms, weakenG:ms } ] }
@@ -55,9 +55,9 @@ export async function main(ns) {
     while (true && (!debug || cycleCount++<2)) {
         ns.clearLog()
         // 2. Prep any that need recovery
-        const status = getTargetRecoveryStatus(ns, moneyHosts, 0.7, 2);
+        const status = getTargetRecoveryStatus(ns, moneyHosts, 0.5, 2);
         if (status.needsRecovery.length > 0) {
-            prepServersStep(ns, servers, status.needsRecovery.map(t => t.host), 0.7, 0.5, 1, isFormula );
+            prepServersStep(ns, servers, status.needsRecovery.map(t => t.host), 0.8, 0.5, 1, isFormula );
         }
         let workers = getUsableHosts(ns, servers);
         let maxCPU  = Math.max(...workers.map(w => w.cores));
@@ -65,13 +65,12 @@ export async function main(ns) {
         // 4. Build/rebuild batch assignments
         let batches = {}
         let maxAmountBatch = 0;
-        let hackFraction = 0.2;
+        let hackFraction = 0.1;
         let minBatchesMem = 0;
         let totalBatchesMem = 0;
         let tries = 0;
-        while(maxAmountBatch == 0 && tries <15) {
-            hackFraction /=2;
-            batches = getBatchPlan(ns, status.ok.map(s=>s.host),hackFraction, 0.7, hackScript, growScript, weakenScript, maxCPU, isFormula)
+        while(maxAmountBatch == 0 && tries <2) {
+            batches = getBatchPlan(ns, status.ok.map(s=>s.host),hackFraction, 0.8, hackScript, growScript, weakenScript, maxCPU, isFormula)
                         
             totalBatchesMem = Object.values(batches).reduce(
             (total, batch) =>
@@ -80,7 +79,9 @@ export async function main(ns) {
                     ?batch.batchMatrix[0][0].batchRam: 0), 0
             );
             //fallback to do at least small hack if nothing is working
-        
+            if(totalBatchesMem>totalAvailableMem) 
+                hackFraction *= 0.9*totalAvailableMem/totalBatchesMem 
+
             minBatchesMem = Object.values(batches).reduce(
             (total, batch) =>
                 Math.min(total,

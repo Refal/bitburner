@@ -10,9 +10,9 @@ export async function main(ns) {
   ns.run("share_manage.js", 1, 1e12)
   
  // 1, depth, share.js ratio(0-10), top target
-  ns.run("distribute-balancer.js", 1, 20, 0, "priority-scheduler.js",1) //, 15)
-  //TODO after purchase formula - switch to that one
-//  ns.run("distribute-balancer.js", 1, 20, 8, "priority-scheduler-improved.js")
+  //ns.run("distribute-balancer.js", 1, 20, 0, "priority-scheduler.js",1) //, 15)
+  
+  ns.run("distribute-balancer.js", 1, 20, 0, "priority-scheduler-improved.js", 1)
   ns.run("hack-stat.js",1, 20)
   //1, money reserv, delay between purch, no money delay
   ns.run("hacknet.js", 1, 1e12, 500, 20_000)  

@@ -1,109 +1,139 @@
 const debug = false;
+
+// ---- Global Settings ----
+const BATCH_WINDOW_MS = 200;    // Minimum allowed gap between phases (safe value)
+const BASE_OFFSET = 200;        // Time between launches of consecutive batches per target (should be >= BATCH_WINDOW_MS)
+const BATCH_PAUSE = 5000;   // pause between planning cycles
+const OFFEST_MAX_TRIES = Math.ceil(BATCH_PAUSE / BATCH_WINDOW_MS) - 1 // we can try to fill a whole pause window - one BATCH_WINDOW gap
+// ---- Global Window Tracker ----
+const batchWindows = {}; // { [target]: [ { hack:ms, grow:ms, weakenH:ms, weakenG:ms } ] }
+
 /** @param {NS} ns */
 export async function main(ns) {
   
-  ns.ui.openTail();
-  ns.clearLog();
+    ns.ui.openTail();
+    ns.clearLog();
+    
+    // 2) Turn off the built-in function logs (so only your prints show)
+    ns.disableLog("ALL");
+
+    // 3) Now that the tail is open and cleared, write your first debug line
+    if (debug) ns.print("===== Script started =====");
+
+    const arg0 = parseInt(ns.args[0]);
+    const maxDepth    = isNaN(arg0) ? 20 : arg0;
+    
+    const arg1 = parseInt(ns.args[1]);
+    const maxTarget    = isNaN(arg1) ? -1 : arg1;
+
+    // Constants
+    const weakenScript = "worker-weaken.js";
+    const growScript = "worker-grow.js";
+    const hackScript = "worker-hack.js";
+    const isFormula = isFormulaAvailable()
+
+    // once at startup, snap the usableHosts and compute a memory‐bounded target list
+    const servers          = scanAllServers(ns, maxDepth)
+    const playerLevel      = ns.getHackingLevel()
+    const isAdvance      = playerLevel>500;
+    let moneyHosts       = servers
+    .filter(h => isAdvance?ns.getServerMaxMoney(h) > 1e9:ns.getServerMaxMoney(h)>0)
+    .filter(s => {
+        const reqHackLevel = ns.getServerRequiredHackingLevel(s);
+        if (reqHackLevel > playerLevel) return false;
+        const maxMoney = ns.getServerMaxMoney(s);
+        // Exclude NaN, 0, negative, undefined, null, or special servers
+        return typeof maxMoney === "number" && isFinite(maxMoney) && maxMoney > 0;
+    })
   
-  // 2) Turn off the built-in function logs (so only your prints show)
-  ns.disableLog("ALL");
+    if(maxTarget>0) {
+        moneyHosts = getTopProfitServers(ns, moneyHosts, maxTarget, isFormula)
+    }        
 
-  // 3) Now that the tail is open and cleared, write your first debug line
-  if (debug) ns.print("===== Script started =====");
-
-  const arg0 = parseInt(ns.args[0]);
-  const maxDepth    = isNaN(arg0) ? 20 : arg0;
-
-  // Constants
-  const weakenScript = "worker-weaken.js";
-  const growScript = "worker-grow.js";
-  const hackScript = "worker-hack.js";
-
- // once at startup, snap the usableHosts and compute a memory‐bounded target list
- const servers          = scanAllServers(ns, maxDepth)
- const playerLevel      = ns.getHackingLevel()
- const isAdvance      = playerLevel>500;
- let moneyHosts       = servers
-  .filter(h => isAdvance?ns.getServerMaxMoney(h) > 1e9:ns.getServerMaxMoney(h)>0)
-  .filter(s => {
-    const reqHackLevel = ns.getServerRequiredHackingLevel(s);
-    if (reqHackLevel > playerLevel) return false;
-    const maxMoney = ns.getServerMaxMoney(s);
-    // Exclude NaN, 0, negative, undefined, null, or special servers
-    return typeof maxMoney === "number" && isFinite(maxMoney) && maxMoney > 0;
-  })
+    let cycleCount = 0
   
-  if(debug) {
-    moneyHosts = getTopProfitServers(ns, moneyHosts, 2)
-  }        
+    while (true && (!debug || cycleCount++<2)) {
+        ns.clearLog()
+        // 2. Prep any that need recovery
+        const status = getTargetRecoveryStatus(ns, moneyHosts, 0.7, 2);
+        if (status.needsRecovery.length > 0) {
+            prepServersStep(ns, servers, status.needsRecovery.map(t => t.host), 0.7, 0.5, 1, isFormula );
+        }
+        let workers = getUsableHosts(ns, servers);
+        let maxCPU  = Math.max(...workers.map(w => w.cores));
+        let totalAvailableMem = workers.map(s=>s.availableMem).reduce((a,b)=> a+b)
+        // 4. Build/rebuild batch assignments
+        let batches = {}
+        let maxAmountBatch = 0;
+        let hackFraction = 0.2;
+        let minBatchesMem = 0;
+        let totalBatchesMem = 0;
+        let tries = 0;
+        while(maxAmountBatch == 0 && tries <15) {
+            hackFraction /=2;
+            batches = getBatchPlan(ns, status.ok.map(s=>s.host),hackFraction, 0.7, hackScript, growScript, weakenScript, maxCPU, isFormula)
+                        
+            totalBatchesMem = Object.values(batches).reduce(
+            (total, batch) =>
+                total +
+                (batch.batchMatrix[0][0].batchRam
+                    ?batch.batchMatrix[0][0].batchRam: 0), 0
+            );
+            //fallback to do at least small hack if nothing is working
+        
+            minBatchesMem = Object.values(batches).reduce(
+            (total, batch) =>
+                Math.min(total,
+                (batch.batchMatrix[0][0].batchRam
+                    ?batch.batchMatrix[0][0].batchRam: Infinity)), Infinity
+            );
 
-   let cycleCount = 0
-  
-  while (true && (!debug || cycleCount++<2)) {
-      ns.clearLog()
-    // 2. Prep any that need recovery
-     const status = getTargetRecoveryStatus(ns, moneyHosts, 0.7, 0.5);
-    if (status.needsRecovery.length > 0) {
-        prepServersStep(ns, servers, status.needsRecovery.map(t => t.host), 0.7, 0.5);
-    }
-    let workers = getUsableHosts(ns, servers);
-    let maxCPU  = Math.max(...workers.map(w => w.cores));
-    let totalAvailableMem = workers.map(s=>s.availableMem).reduce((a,b)=> a+b)
-    // 4. Build/rebuild batch assignments
-    let batches = getBatchPlan(ns, status.ok.map(s=>s.host), 0.1, 0.7, hackScript, growScript, weakenScript, maxCPU)
-    
-    
-    // ns.printf("workers length: %d", workers.length)
-    //ns.printf(`batch length: ${Object.keys(batches).length}`)
-    const totalBatchesMem = Object.values(batches).reduce(
-    (total, batch) =>
-        total +
-        (batch.batchMatrix[0][0].batchRam
-            ?batch.batchMatrix[0][0].batchRam: 0), 0
-    );
-    
-    const maxAmountBatch = calcMaxParallelBatches(totalAvailableMem, totalBatchesMem)
-    
+            maxAmountBatch = calcMaxParallelBatches(totalAvailableMem, totalBatchesMem)
+      
+            tries++;
+        }
+        
 
-    // Call in main loop:
-    const batchAssignments = assignAllBatchesWithWindows(ns, batches, workers, maxAmountBatch);
+        // Call in main loop:
+        const batchAssignments = assignAllBatchesWithWindows(ns, batches, workers, maxAmountBatch);
 
-    
-    // 5. Launch as many batches as desired
-    let batchFailures = await launchMultiBatches(ns, batchAssignments);
-    
-    const { totalMem, freeMem } = getMemoryStatsForHosts(workers);
+        
+        // 5. Launch as many batches as desired
+        let batchFailures = await launchMultiBatches(ns, batchAssignments);
+        
+        const { totalMem, freeMem } = getMemoryStatsForHosts(workers);
 
-    const preppingArr = Array.isArray(status.needsRecovery) ? status.needsRecovery : [];
+        const preppingArr = Array.isArray(status.needsRecovery) ? status.needsRecovery : [];
 
-    const moneyNeeded = preppingArr
-    .map(r => Number(r.moneyNeeded) || 0)
-    .reduce((a, b) => a + b, 0);
+        const moneyNeeded = preppingArr
+        .map(r => Number(r.moneyNeeded) || 0)
+        .reduce((a, b) => a + b, 0);
 
-    const secToReduce = preppingArr
-    .map(r => Number(r.secToReduce) || 0)
-    .reduce((a, b) => a + b, 0);
+        const secToReduce = preppingArr
+        .map(r => Number(r.secToReduce) || 0)
+        .reduce((a, b) => a + b, 0);
 
-    ns.print([
-    `[${(new Date()).toLocaleTimeString()}] Batch Cycle`,
-    `Targets: ${moneyHosts.length}`,
-    `  Ready: ${status.ok.length} | Prepping: ${preppingArr.length}`,
-    `  $ Needed: ${shortNum(moneyNeeded)} | Sec to Reduce: ${secToReduce.toFixed(2)}`,
-    `Workers: ${workers.length} | Parallel/target: ${maxAmountBatch}`,
-    `RAM: Used ${(totalMem-freeMem).toFixed(1)} / ${totalMem.toFixed(1)} GB`,
-    `     Free: ${freeMem.toFixed(1)} GB`,
-    `Batches: ${batchAssignments.length} | BatchMem: ${totalBatchesMem.toFixed(1)} GB` +
-        (batchFailures > 0 ? ` | ⚠️ Skipped: ${batchFailures}` : "")
-    ].join('\n'));
-
-    if(debug){
         ns.print([
-        `[SUMMARY] Batch: ${status.ok.length}, Prep: ${status.needsRecovery.length}, Idle: ${moneyHosts.length - status.ok.length - status.needsRecovery.length}`
+        `[${(new Date()).toLocaleTimeString()}] Batch Cycle`,
+        `Targets: ${moneyHosts.length}`,
+        `  Ready: ${status.ok.length} | Prepping: ${preppingArr.length}`,
+        `  $ Needed: ${shortNum(moneyNeeded)} | Sec to Reduce: ${secToReduce.toFixed(2)}`,
+        `Workers: ${workers.length} | Parallel/target: ${maxAmountBatch}`,
+        `RAM: Used ${(totalMem-freeMem).toFixed(1)} / ${totalMem.toFixed(1)} GB`,
+        `     Free: ${freeMem.toFixed(1)} GB`,
+        `Batches: ${batchAssignments.length}, hackFraction: ${hackFraction}`,
+        `. BatchMem: ${totalBatchesMem.toFixed(1)} GB/MinBatchMem: ${minBatchesMem.toFixed(1)} GB` +
+            (batchFailures > 0 ? ` | ⚠️ Skipped: ${batchFailures}` : "")
         ].join('\n'));
+
+        if(debug){
+            ns.print([
+            `[SUMMARY] Batch: ${status.ok.length}, Prep: ${status.needsRecovery.length}, Idle: ${moneyHosts.length - status.ok.length - status.needsRecovery.length}`
+            ].join('\n'));
+        }
+        // 6. Wait before next cycle
+        await ns.sleep(BATCH_PAUSE); // 5 seconds—tune for your environment!
     }
-      // 6. Wait before next cycle
-      await ns.sleep(15000); // 5 seconds—tune for your environment!
-  }
 }
 
 /**
@@ -177,20 +207,37 @@ export function getBatchPlan(
     hackScript,
     growScript,
     weakenScript,
-    maxCores = 3
+    maxCores = 3,
+    isFormulaAvailable = false 
 ) {
     const player = ns.getPlayer();
     const result = {};
+    const hackRam = ns.getScriptRam(hackScript);
+    const growRam = ns.getScriptRam(growScript);
+    const weakenRam = ns.getScriptRam(weakenScript);
 
-    for (const hostname of servers) {
-        const hackRam = ns.getScriptRam(hackScript);
-        const growRam = ns.getScriptRam(growScript);
-        const weakenRam = ns.getScriptRam(weakenScript);
+    for (const hostname of servers) {    
         const server = ns.getServer(hostname);
         const maxMoney = server.moneyMax;
         const curMoney = Math.max(server.moneyAvailable, 1);
-        const hackChance = ns.formulas.hacking.hackChance(server, player);
-        const hackPercent = ns.formulas.hacking.hackPercent(server, player);
+
+        // --- HACK calculations
+        let hackChance, hackPercent, hackTime, growTime, weakenTime;
+        if (isFormulaAvailable && ns.formulas && ns.formulas.hacking) {
+            hackChance = ns.formulas.hacking.hackChance(server, player);
+            hackPercent = ns.formulas.hacking.hackPercent(server, player);
+            hackTime = ns.formulas.hacking.hackTime(server, player);
+            growTime = ns.formulas.hacking.growTime(server, player);
+            weakenTime = ns.formulas.hacking.weakenTime(server, player);
+        } else {
+            // Fallbacks (estimates, not as accurate as formulas)
+            hackChance = ns.hackAnalyzeChance(hostname);
+            hackPercent = ns.hackAnalyze(hostname);
+            hackTime = ns.getHackTime(hostname);
+            growTime = ns.getGrowTime(hostname);
+            weakenTime = ns.getWeakenTime(hostname);
+        }
+        
         // Plan to hack hackFraction of "after grow" money (the steady state)
         const batchMoney = maxMoney * maxMoneFraction; // Steady-state batch money
         const hackAmount = batchMoney * hackFraction;  // e.g., 0.1 for 10% of batch state
@@ -198,10 +245,7 @@ export function getBatchPlan(
             ? Math.ceil(hackAmount / (batchMoney * hackPercent * hackChance))
             : 0;
         // Simulate post-hack state for grow planning
-        const postHackMoney = batchMoney - hackAmount;
-        const hackTime = ns.formulas.hacking.hackTime(server, player);
-        const growTime = ns.formulas.hacking.growTime(server, player);
-        const weakenTime = ns.formulas.hacking.weakenTime(server, player);
+        const postHackMoney = batchMoney - hackAmount;        
         const secIncreaseHack = ns.hackAnalyzeSecurity(hackThreads);
 
         // For hack/weaken after hack, just use 1 core (you could expand for hack/weaken cores too if needed)
@@ -218,10 +262,16 @@ export function getBatchPlan(
         const batchMatrix = [];
         for (let growCores = 1; growCores <= maxCores; ++growCores) {
             batchMatrix[growCores - 1] = [];
-            //const growThreads = Math.ceil(ns.formulas.hacking.growThreads(server, player, afterGrowMoney, growCores));
-             const growThreads = Math.ceil(ns.formulas.hacking.growThreads(
-               { ...server, moneyAvailable: postHackMoney }, player, batchMoney, growCores
-            ));
+            let growThreads;
+            if (isFormulaAvailable && ns.formulas && ns.formulas.hacking) {
+                growThreads = Math.ceil(ns.formulas.hacking.growThreads(
+                    { ...server, moneyAvailable: postHackMoney }, player, batchMoney, growCores
+                ));
+            } else {
+                // Fallback: growthAnalyze ratio (ignores cores, but it's the only API available)
+                // ns.growthAnalyze(host, growth, cores) - we use growCores here for best-guess
+                growThreads = Math.ceil(ns.growthAnalyze(hostname, batchMoney / Math.max(1, postHackMoney), growCores));
+            } 
             const secIncGrow = ns.growthAnalyzeSecurity(growThreads, hostname, growCores);
             for (let weakenCores = 1; weakenCores <= maxCores; ++weakenCores) {
                 const weakenPerThread = ns.weakenAnalyze(1, weakenCores);
@@ -253,9 +303,13 @@ export function getBatchPlan(
                     weakenHOffset,
                     weakenGOffset,
                 };
+                 if (batchRam === 0) {
+                   ns.print(`[WARN][${hostname}] batchMatrix[${growCores - 1}][${weakenCores - 1}] batchRam=0 (hackT=${hackThreads}, growT=${growThreads}, weakH=${weakenThreadsAfterHack}, weakG=${weakenAfterGrow})`);
+                }
             }
+           
         }
-       
+      
         result[hostname] = {
             server: hostname,
             maxMoney,
@@ -336,7 +390,8 @@ export function prepServersStep(
     targets,
     moneyTargetFrac = 0.9,
     secBuffer = 0.5,
-    maxGrowCores = 8
+    maxGrowCores = 1,
+    isFormulaAvailable = false
 ) {
     const growScript = "worker-grow.js";
     const weakenScript = "worker-weaken.js";
@@ -371,37 +426,6 @@ export function prepServersStep(
     let workersState = availableWorkers.map(w => ({ ...w }));
 
     for (const stat of prepping) {
-        // GROW needed
-        if (!stat.moneyOk) {
-            let sorted = workersState
-                .map((w, i) => ({ ...w, i }))
-                .sort((a, b) => b.cores - a.cores || b.availableMem - a.availableMem);
-
-            let best = sorted[0];
-            let server = ns.getServer(stat.host);
-            let player = ns.getPlayer();
-            let growThreadsTotal = Math.ceil(ns.formulas.hacking.growThreads(
-                server, player, stat.moneyGoal, Math.min(best.cores, maxGrowCores)
-            ));
-            let runningGrow = countActiveThreads(ns, servers, growScript, stat.host);
-            let growThreadsLeft = Math.max(0, growThreadsTotal - runningGrow);
-
-            for (const w of sorted) {
-                if (growThreadsLeft <= 0) break;
-                const assign = Math.min(growThreadsLeft, Math.floor(w.availableMem / growRam));
-                if (assign > 0) {
-                    const pid = ns.exec(growScript, w.host, assign, stat.host, assign);
-                    if (pid === 0) continue;
-                    w.availableMem -= assign * growRam;
-                    workersState[w.i].availableMem = w.availableMem;
-                    growThreadsLeft -= assign;
-                }
-            }
-             
-            if (debug && growThreadsLeft > 0) {
-                ns.print(`[PREP-FAIL][${stat.host}] Could not assign ${growThreadsLeft} grow threads (RAM?)`);
-            }
-        }
         // WEAKEN needed
         if (stat.secHigh) {
             let server = ns.getServer(stat.host);
@@ -425,7 +449,44 @@ export function prepServersStep(
             if(debug && weakenThreadsLeft > 0) {
                 ns.print(`[PREP-FAIL][${stat.host}] Could not assign ${weakenThreadsLeft} weaken threads (RAM?)`);
             }
-        }                
+        }        
+        // GROW needed
+        if (!stat.moneyOk) {
+            let sorted = workersState
+                .map((w, i) => ({ ...w, i }))
+                .sort((a, b) => b.cores - a.cores || b.availableMem - a.availableMem);
+
+            let best = sorted[0];
+            let server = ns.getServer(stat.host);
+            let player = ns.getPlayer();
+            let growThreadsTotal = 0;
+            if (isFormulaAvailable) {
+                growThreadsTotal = Math.ceil(ns.formulas.hacking.growThreads(
+                    server, player, stat.moneyGoal, Math.min(best.cores, maxGrowCores)
+                ));
+            } else {
+                // Fallback: Use ns.growthAnalyze (does not consider cores, but okay as fallback)
+                growThreadsTotal = Math.ceil(ns.growthAnalyze(stat.host, stat.moneyGoal / Math.max(1, stat.money), best.cores));
+            }
+            let runningGrow = countActiveThreads(ns, servers, growScript, stat.host);
+            let growThreadsLeft = Math.max(0, growThreadsTotal - runningGrow);
+
+            for (const w of sorted) {
+                if (growThreadsLeft <= 0) break;
+                const assign = Math.min(growThreadsLeft, Math.floor(w.availableMem / growRam));
+                if (assign > 0) {
+                    const pid = ns.exec(growScript, w.host, assign, stat.host, assign);
+                    if (pid === 0) continue;
+                    w.availableMem -= assign * growRam;
+                    workersState[w.i].availableMem = w.availableMem;
+                    growThreadsLeft -= assign;
+                }
+            }             
+            if (debug && growThreadsLeft > 0) {
+                ns.print(`[PREP-FAIL][${stat.host}] Could not assign ${growThreadsLeft} grow threads (RAM?)`);
+            }
+        }
+                
     }
 }
 
@@ -491,32 +552,57 @@ export function calcMaxParallelBatches(totalAvailableMem, batchRam) {
  * @param {number} topN - How many servers to return
  * @returns {Array} Sorted array of server info with calculated profit per thread per second
  */
-export function getTopProfitServers(ns, servers, topN) {
+export function getTopProfitServers(ns, servers, topN, isFormulaAvailable = false) {
   const player = ns.getPlayer()
     // Helper to get info if only name is provided
     function getInfo(server) {
-        return {
-            ...server,
-            hackChance: ns.formulas.hacking.hackChance(server, player),
-            hackTime: ns.formulas.hacking.hackTime(server, player),
-            weakenTime : ns.formulas.hacking.weakenTime(server, player),
-            maxMoney: ns.getServerMaxMoney(server.hostname),
-            curMoney: ns.getServerMoneyAvailable(server.hostname)
-        };
+        const hostname = server.hostname || server.name || server; 
+        if (isFormulaAvailable && ns.formulas && ns.formulas.hacking) {
+            // Use formulas API
+            return {
+                ...server,
+                hackChance: ns.formulas.hacking.hackChance(server, player),
+                hackTime: ns.formulas.hacking.hackTime(server, player),
+                weakenTime: ns.formulas.hacking.weakenTime(server, player),
+                maxMoney: ns.getServerMaxMoney(server.hostname),
+                curMoney: ns.getServerMoneyAvailable(server.hostname),
+                hostname
+            };
+        } else {
+            return {
+                ...server,
+                hackChance: ns.hackAnalyzeChance(hostname),
+                hackTime: ns.getHackTime(hostname),
+                weakenTime: ns.getWeakenTime(hostname),
+                maxMoney: ns.getServerMaxMoney(hostname),
+                curMoney: ns.getServerMoneyAvailable(hostname),
+                hostname, // ensure hostname always present
+            };
+        }
     }
 
-    // Map, calculate, and filter for servers with positive values
-    const serversWithProfit = servers.map(s=>ns.getServer(s)).map(getInfo).map(s => ({
+    // Normalize: always get server object (if only string provided)
+    const normalizedServers = servers.map(s => (typeof s === "string" ? ns.getServer(s) : s));
+    
+    const serversWithProfit = normalizedServers.map(getInfo).map(s => ({
         ...s,
-        profitPerThreadPerSec: s.weakenTime > 0 ? (s.maxMoney * s.hackChance / s.weakenTime / 1000) : 0,
-    }))
-    .filter(s => s.profitPerThreadPerSec > 0 && s.maxMoney > 0 && s.curMoney > 0);
-    ns.printf("servers profit: %j", serversWithProfit)
+        profitPerThreadPerSec: s.weakenTime > 0
+            ? (s.maxMoney * s.hackChance / s.weakenTime / 1000)
+            : 0,
+    })).filter(s =>
+        s.profitPerThreadPerSec > 0 &&
+        s.maxMoney > 0 &&
+        s.curMoney > 0
+    );
+
     // Sort by profit descending
     serversWithProfit.sort((a, b) => b.profitPerThreadPerSec - a.profitPerThreadPerSec);
 
-    // Return top N
-    return serversWithProfit.slice(0, topN).map(s=>s.hostname);
+    // Optionally print debug output
+    // ns.printf("servers profit: %j", serversWithProfit);
+
+    // Return top N hostnames
+    return serversWithProfit.slice(0, topN).map(s => s.hostname);
 }
 
 function countActiveThreads(ns, workers, scriptName, target) {
@@ -530,14 +616,6 @@ function countActiveThreads(ns, workers, scriptName, target) {
     }
     return count;
 }
-
-// ---- Global Settings ----
-const BATCH_WINDOW_MS = 200;    // Minimum allowed gap between phases (safe value)
-const BASE_OFFSET = 200;        // Time between launches of consecutive batches per target (should be >= BATCH_WINDOW_MS)
-
-// ---- Global Window Tracker ----
-const batchWindows = {}; // { [target]: [ { hack:ms, grow:ms, weakenH:ms, weakenG:ms } ] }
-
 
 // ---- Batch Window Helpers ----
 function canScheduleBatch(target, landings) {
@@ -599,7 +677,7 @@ function assignAllBatchesWithWindows(ns, batches, workers, maxBatchesPerTarget) 
             let scheduledBatches = 0;
             while (scheduledBatches < max_batches) {
                 let extraOffset = 0, tries = 0, scheduled = false;
-                while (tries < 40 && !scheduled) {
+                while (tries < OFFEST_MAX_TRIES && !scheduled) {
                     // Pick stats for this (growCores, weakenCores)
                     let stats = batchTemplate.batchMatrix[coreAttempt - 1][coreAttempt - 1]; // square fallback
                     if (!stats) break; // if no such entry
@@ -627,7 +705,7 @@ function assignAllBatchesWithWindows(ns, batches, workers, maxBatchesPerTarget) 
                         if (canAssign) {
                             if(debug) {
                                 // For each target you are trying to batch:
-                                ns.print('\[BATCHER] ${target}: batch assigned')                                
+                                ns.print(`\[BATCHER] ${target}: batch assigned`)                                
                                 const server = ns.getServer(target);
                                 const runningHack = countActiveThreads(ns, workers, "worker-hack.js", target);
                                 const runningGrow = countActiveThreads(ns, workers, "worker-grow.js", target);
@@ -650,8 +728,10 @@ function assignAllBatchesWithWindows(ns, batches, workers, maxBatchesPerTarget) 
                             scheduled = true;
                             break;
                         } else {
-                            if(debug) ns.print('\[BATCHER] ${target}: not enough RAM/cores')
+                            if(debug) ns.print(`\[BATCHER] ${target}: not enough RAM/cores`)
                         }
+                    } else {
+                        if(debug) ns.print(`\[BATCHER] ${target}: can not schedule that landing: ${String.values(...landings)}`)
                     }
                     // Slide forward in time
                     extraOffset += BATCH_WINDOW_MS;
@@ -715,13 +795,17 @@ function tryAssignBatchWithOffsets(
     const growThreads    = Math.ceil(stats.growThreads);
     const weakenHThreads = Math.ceil(batchTemplate.weakenThreadsAfterHack);
     const weakenGThreads = Math.ceil(stats.weakenAfterGrow);
+    const simulatedWorkers = workerStates.map(w => ({ ...w }));
 
     const assignments = [];
     let canAssign = true;
-
+     if(debug) {
+        ns.printf("Worker's stat: %j", workerStates)
+        ns.printf("trying to assign stats: %j", stats)
+     }
     // GROW
     let threadsLeft = growThreads;
-    let growWorkers = workerStates
+    let growWorkers = simulatedWorkers
         .filter(w => w.cores >= stats.growCores && w.availableMem >= growRam)
         .sort((a, b) => b.cores - a.cores || b.availableMem - a.availableMem);
     for (const w of growWorkers) {
@@ -747,7 +831,7 @@ function tryAssignBatchWithOffsets(
 
     // WEAKEN AFTER GROW
     threadsLeft = weakenGThreads;
-    let weakenGWorkers = workerStates
+    let weakenGWorkers = simulatedWorkers
         .filter(w => w.cores >= stats.weakenCores && w.availableMem >= weakenRam)
         .sort((a, b) => b.cores - a.cores || b.availableMem - a.availableMem);
     for (const w of weakenGWorkers) {
@@ -772,7 +856,7 @@ function tryAssignBatchWithOffsets(
 
     // HACK
     threadsLeft = hackThreads;
-    let hackWorkers = workerStates
+    let hackWorkers = simulatedWorkers
         .filter(w => w.availableMem >= hackRam)
         .sort((a, b) => b.availableMem - a.availableMem);
     for (const w of hackWorkers) {
@@ -797,7 +881,7 @@ function tryAssignBatchWithOffsets(
 
     // WEAKEN AFTER HACK
     threadsLeft = weakenHThreads;
-    let weakenHWorkers = workerStates
+    let weakenHWorkers = simulatedWorkers
         .filter(w => w.cores >= stats.weakenCores && w.availableMem >= weakenRam)
         .sort((a, b) => b.cores - a.cores || b.availableMem - a.availableMem);
     for (const w of weakenHWorkers) {
@@ -819,6 +903,12 @@ function tryAssignBatchWithOffsets(
             ns.print(`[SKIP][${batchTemplate.server}] Not enough RAM/cores for phase: weakenH, needed: ${threadsLeft}`);
         }
     }
+    if (canAssign) {
+    // Only now apply simulated state to real workerStates
+    for (let i = 0; i < workerStates.length; i++) {
+          workerStates[i].availableMem = simulatedWorkers[i].availableMem;
+        }
+    }
 
     return {assignments, canAssign};
 }
@@ -830,4 +920,19 @@ function shortNum(n) {
   if (n >= 1e6)  return (n / 1e6 ).toFixed(2) + "m";
   if (n >= 1e3)  return (n / 1e3 ).toFixed(2) + "k";
   return n.toFixed(2);
+}
+
+function isFormulaAvailable() {
+    try {
+        // Pick any owned server to check (home is always safe)
+        if (ns.formulas && ns.formulas.hacking) {
+        const player = ns.getPlayer();
+        const target = ns.getServer("home");
+        // Try any formulas call
+        ns.formulas.hacking.hackChance(target, player);
+        return true;
+        }
+    } catch (e) {
+        return false;
+    }
 }

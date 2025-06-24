@@ -1,10 +1,15 @@
 const debug = false;
 
 // ---- Global Settings ----
-const BATCH_WINDOW_MS = 200;    // Minimum allowed gap between phases (safe value)
+const BATCH_WINDOW_MS = 150;    // Minimum allowed gap between phases (safe value)
 const BASE_OFFSET = 200;        // Time between launches of consecutive batches per target (should be >= BATCH_WINDOW_MS)
-const BATCH_PAUSE = 3000;   // pause between planning cycles
+const BATCH_PAUSE = 5000;   // pause between planning cycles
 const OFFEST_MAX_TRIES = Math.ceil(BATCH_PAUSE / BATCH_WINDOW_MS) - 1 // we can try to fill a whole pause window - one BATCH_WINDOW gap
+// These are typical safe values; adjust as desired
+const GAP_WEAKEN_H = 20;       // Gap between hack and weakenH landings (ms)
+const GAP_GROW = 100;          // Gap between hack and grow landings (ms)
+const GAP_WEAKEN_G = 20;       // Gap between grow and weakenG landings (ms)
+
 // ---- Global Window Tracker ----
 const batchWindows = {}; // { [target]: [ { hack:ms, grow:ms, weakenH:ms, weakenG:ms } ] }
 
@@ -25,7 +30,7 @@ export async function main(ns) {
     
     const arg1 = parseInt(ns.args[1]);
     const maxTarget    = isNaN(arg1) ? -1 : arg1;
-
+    const minMoney = isNaN(ns.args[2])? 0 : Number(ns.args[2])
     // Constants
     const weakenScript = "worker-weaken.js";
     const growScript = "worker-grow.js";
@@ -37,7 +42,7 @@ export async function main(ns) {
     const playerLevel      = ns.getHackingLevel()
     const isAdvance      = playerLevel>500;
     let moneyHosts       = servers
-    .filter(h => isAdvance?ns.getServerMaxMoney(h) > 1e9:ns.getServerMaxMoney(h)>0)
+    .filter(h => minMoney < ns.getServerMaxMoney(h))
     .filter(s => {
         const reqHackLevel = ns.getServerRequiredHackingLevel(s);
         if (reqHackLevel > playerLevel) return false;
@@ -68,32 +73,37 @@ export async function main(ns) {
         let hackFraction = 0.1;
         let minBatchesMem = 0;
         let totalBatchesMem = 0;
-        let tries = 0;
-        while(maxAmountBatch == 0 && tries <2) {
+
+        batches = getBatchPlan(ns, status.ok.map(s=>s.host),hackFraction, 0.8, hackScript, growScript, weakenScript, maxCPU, isFormula)
+                    
+        totalBatchesMem = Object.values(batches).reduce(
+        (total, batch) =>
+            total +
+            (batch.batchMatrix[0][0].batchRam
+                ?batch.batchMatrix[0][0].batchRam: 0), 0
+        );
+        maxAmountBatch = calcMaxParallelBatches(totalAvailableMem, totalBatchesMem)
+        
+        //fallback to do at least small hack if nothing is working
+        if(maxAmountBatch == 0) {            
+            hackFraction *= 0.9*totalAvailableMem/totalBatchesMem 
             batches = getBatchPlan(ns, status.ok.map(s=>s.host),hackFraction, 0.8, hackScript, growScript, weakenScript, maxCPU, isFormula)
-                        
+                    
             totalBatchesMem = Object.values(batches).reduce(
             (total, batch) =>
                 total +
                 (batch.batchMatrix[0][0].batchRam
                     ?batch.batchMatrix[0][0].batchRam: 0), 0
             );
-            //fallback to do at least small hack if nothing is working
-            if(totalBatchesMem>totalAvailableMem) 
-                hackFraction *= 0.9*totalAvailableMem/totalBatchesMem 
-
-            minBatchesMem = Object.values(batches).reduce(
-            (total, batch) =>
-                Math.min(total,
-                (batch.batchMatrix[0][0].batchRam
-                    ?batch.batchMatrix[0][0].batchRam: Infinity)), Infinity
-            );
-
             maxAmountBatch = calcMaxParallelBatches(totalAvailableMem, totalBatchesMem)
-      
-            tries++;
         }
-        
+
+        minBatchesMem = Object.values(batches).reduce(
+        (total, batch) =>
+            Math.min(total,
+            (batch.batchMatrix[0][0].batchRam
+                ?batch.batchMatrix[0][0].batchRam: Infinity)), Infinity
+        );        
 
         // Call in main loop:
         const batchAssignments = assignAllBatchesWithWindows(ns, batches, workers, maxAmountBatch);
@@ -253,11 +263,28 @@ export function getBatchPlan(
         const weakenThreadsAfterHack = Math.ceil(secIncreaseHack / ns.weakenAnalyze(1));
 
         // PHASE OFFSETS
-        // These offsets are standard for 4-phase Bitburner batching:
-        const hackOffset = weakenTime - hackTime;
-        const growOffset = weakenTime - growTime + 100; // 100ms after hack lands
-        const weakenHOffset = 0;                        // Hack weaken lands last
-        const weakenGOffset = 200;                      // Grow weaken lands slightly after grow
+        // // These offsets are standard for 4-phase Bitburner batching:
+        // const hackOffset = weakenTime - hackTime;
+        // const growOffset = weakenTime - growTime + 100; // 100ms after hack lands
+        // const weakenHOffset = 20;                        // Hack weaken lands last
+        // const weakenGOffset = 200;                      // Grow weaken lands slightly after grow
+        
+        // Landings all relative to batch end (weakens finish together)
+        const batchEnd = weakenTime; // when the weakens should finish
+
+        // Hack should finish right before weakenH
+        const hackLanding    = batchEnd - GAP_WEAKEN_H;
+        const weakenHLanding = batchEnd;
+        const growLanding    = batchEnd + GAP_GROW;
+        const weakenGLanding = growLanding + GAP_WEAKEN_G;
+
+        // Launch offsets relative to 'now'
+        const hackOffset    = hackLanding    - hackTime;
+        const weakenHOffset = weakenHLanding - weakenTime;
+        const growOffset    = growLanding    - growTime;
+        const weakenGOffset = weakenGLanding - weakenTime;
+                
+        
 
         // Precompute grow/weaken matrices
         const batchMatrix = [];
@@ -543,7 +570,7 @@ export function getTargetRecoveryStatus(ns, targets, moneyFrac = 0.9, secBuffer 
  */
 export function calcMaxParallelBatches(totalAvailableMem, batchRam) {
     if (batchRam <= 0) return 0;
-    return Math.floor(totalAvailableMem / batchRam);
+    return Math.min(Math.floor(totalAvailableMem / batchRam), Math.floor(BATCH_PAUSE/BATCH_WINDOW_MS));
 }
 
 /**
@@ -669,9 +696,8 @@ function assignAllBatchesWithWindows(ns, batches, workers, maxBatchesPerTarget) 
         const batchTemplate = batches[target];
         let batchNum = 0;
         const batch_duration = batchTemplate.weakenTime; // or time between scheduling and the *last* phase
-        const base_offset = BASE_OFFSET; // e.g., 200 ms
         
-        const max_batches = Math.min(maxBatchesPerTarget, Math.floor(batch_duration / base_offset));
+        const max_batches = Math.min(maxBatchesPerTarget, Math.floor(batch_duration / BASE_OFFSET));
 
         // Try from highest to lowest cores, to maximize batch quality
         for (let coreAttempt = batchTemplate.batchMatrix.length; coreAttempt >= 1; coreAttempt--) {

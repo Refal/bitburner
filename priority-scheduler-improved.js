@@ -1,10 +1,10 @@
 const debug = false;
 
 // ---- Global Settings ----
-const BATCH_WINDOW_MS = 150;    // Minimum allowed gap between phases (safe value)
-const BASE_OFFSET = 150;        // Time between launches of consecutive batches per target (should be >= BATCH_WINDOW_MS)
-const BATCH_PAUSE = 3_000;   // pause between planning cycles
-const OFFEST_MAX_TRIES = Math.ceil(BATCH_PAUSE / BATCH_WINDOW_MS) - 1 // we can try to fill a whole pause window - one BATCH_WINDOW gap
+const BATCH_WINDOW = []; // BATCH window per target
+const BATCH_WINDOW_MS = 20;    // Minimum allowed gap between phases (safe value)
+const BATCH_PAUSE = 400;   // pause between planning cycles
+
 // These are typical safe values; adjust as desired
 const GAP_WEAKEN_H = 20;       // Gap between hack and weakenH landings (ms)
 const GAP_GROW = 80;          // Gap between hack and grow landings (ms)
@@ -12,32 +12,40 @@ const GAP_WEAKEN_G = 20;       // Gap between grow and weakenG landings (ms)
 
 const MIN_HACK_FRACTION = 0.001;
 //do not consider host with a weaken time  > MAX_BATCH_TIME
-const MAX_BATCH_TIME = 120 * 1000; // e.g., 2 minutes in ms
-const MAX_TOTAL_BATCHES  = 100;
-const MIN_TARGET_MONEY = 4.1e6;
+let MAX_BATCH_TIME = 33 * 1000; // e.g., 2 minutes in ms
+let MAX_TARGET_COUNT = 10;
+// increase if you see a constant all targets full lock
+let MAX_TOTAL_BATCHES  = 11;
+const MIN_ALLOWED_BATCH_PER_TARGET = 11;
+const MAX_ALLOWED_BATCH_PER_TARGET = 41;
+const FREE_MEM_HISTORY_WINDOW = 30; // Or any window size you want
+const freeMemHistory = [];
+
+
+const MIN_TARGET_MONEY = 1e6; //buy SQLInjector first
 
 // additional multiplier to balance grow and weaken for multibutch assignments
 // change them based on growing of prep servers
 // Globals (outside the function)
-let GROW_THREADS_COMP_MULT = 0.6;
-let WEAKEN_THREADS_COMP_MULT = 5.2;
-let lastTuneTime = 0;
-
+let GROW_THREADS_COMP_MULT = 0.0;
+let WEAKEN_THREADS_COMP_MULT = 0.1;
+let lastTuneTime = Date.now();
+let lastBatchTime = Date.now();
+const BATCH_ADJUST_PAUSE = 60_000; //5 min
 
 const growPrepPctHistory = [];
 const weakenPrepPctHistory = [];
 
 let autoTunePeriod = 120000; // Initial period: 2 min
-let growStep = 0.02; // Start with ±2%
-let weakenStep = 0.02;
+
 
 const TARGET_PREP_PCT = 10; // %
-const INCREASE_IF_BELOW = 1; // %
+const INCREASE_IF_BELOW = 5; // %
 
 // How often to check (ms)
-const MULTI_ADJUST_CALM_PERIOD = 240_000; // 4m
-const MULTI_ADJUST_NOISE_PERIOD = 60_000; // 1m
-const PREP_HISTORY_WINDOW = MULTI_ADJUST_CALM_PERIOD/BATCH_PAUSE;
+const MULTI_ADJUST_CALM_PERIOD = 60_000; // 3m
+const MULTI_ADJUST_NOISE_PERIOD = 30_000; // 1m
+const PREP_HISTORY_WINDOW = Math.ceil(MULTI_ADJUST_NOISE_PERIOD/BATCH_PAUSE);
 
 
 // ---- Global Window Tracker ----
@@ -50,14 +58,13 @@ const prepInFlightMap = {};
 /** @param {NS} ns */
 export async function main(ns) {
     ns.ui.openTail();
-    ns.ui.moveTail(930,30)
-    ns.ui.resizeTail(575, 400)
+    ns.ui.moveTail(870,40)
+    ns.ui.resizeTail(620, 395)
     ns.clearLog();
     ns.disableLog("ALL");
     if (debug) ns.print("===== Script started =====");
 
     const maxDepth = parseIntOrDefault(ns.args[0], 20);
-    const maxTarget = parseIntOrDefault(ns.args[1], 60);
     const weakenScript = "worker-weaken.js";
     const growScript = "worker-grow.js";
     const hackScript = "worker-hack.js";
@@ -65,10 +72,13 @@ export async function main(ns) {
     let lastEligibleHosts = [];
     let count = 0;
     let lastServerList = []
+    let retargetInterval = 5;
+    let cycleCount = 0;
     while (true) {
         ns.clearLog();
         const now = Date.now();
         pruneOldBatches(now);
+        cleanupPrepInFlight(now); 
         // ---- 1. Dynamically scan and choose best money hosts
         const servers = scanAllServers(ns, maxDepth);
         if (!arraysEqual(servers, lastServerList)) {
@@ -90,9 +100,7 @@ export async function main(ns) {
         const isFormula = isFormulaAvailable(ns);
         const batchesLimit = getBatchPlan(ns, allMoneyHosts, 0.1, 0.8, hackScript, growScript, weakenScript, 1, isFormula);
 
-        let lastSortedMoneyHosts = [];
-        let retargetInterval = 5;
-        let cycleCount = 0;
+   
         // Get the latest list of eligible hostnames
         let currentHostList = getUsableHosts(ns, servers)
         .map(s => s.host);
@@ -102,27 +110,29 @@ export async function main(ns) {
         lastEligibleHosts = currentHostList; // update for next cycle
 
         if (cycleCount++ % retargetInterval === 0 || hostsChanged) {
-             let sortedBatches = getSortedLimitedBatchArrayDynamic(batchesLimit,  getUsableHosts(ns, servers), maxTarget)
-            lastSortedMoneyHosts = sortedBatches.map(({target}) => target);
+            const sortedBatches = getSortedLimitedBatchArrayDynamic(batchesLimit,  lastEligibleHosts)
+            const maxWeakenTime = sortedBatches.length ? Math.max(...sortedBatches.map(m => m.weakenTime)) : 0;
+            retargetInterval = Math.max(5, Math.floor(maxWeakenTime / BATCH_PAUSE))
+            lastEligibleHosts = sortedBatches.map(({target}) => target);
         }
-        let moneyHosts = lastSortedMoneyHosts;
+        let moneyHosts = lastEligibleHosts;
 
         // ---- 4. Batch prep/assignment/launch
-        const status = getTargetRecoveryStatus(ns, moneyHosts, 0.4, 4);
+        const status = getTargetRecoveryStatus(ns, moneyHosts, 0.4, 1.5);
         if (status.needsRecovery.length > 0) {
-            await prepServersStep(ns, servers, status.needsRecovery.map(t => t.host), 0.8, 0.5, 1, isFormula);
+            await prepServersStep(ns, servers, status.needsRecovery.map(t => t.host), 0.7, 0.5, 1, isFormula);
         }
         let workers = getUsableHosts(ns, servers);
-        let maxCPU  = Math.min(Math.max(...workers.map(w => w.cores)), 8);
+        let maxCPU  = Math.min(Math.max(...workers.map(w => w.cores)), 10);
         let totalAvailableMem = workers.map(s=>s.availableMem).reduce((a,b)=> a+b, 0);
         const totalMaxsMem = workers.map(s=>s.maxMem).reduce((a,b)=> a+b, 0);
         
-        autoTuneMultipliers(ns);
+        autoTuneMultipliers(ns, workers, totalAvailableMem, totalMaxsMem, allMoneyHosts, isFormula);
         ns.print(lastAutoTuneSummary);
 
         let hackFraction = 0.1;
         let batches = getBatchPlan(ns, status.ok.map(s=>s.host), hackFraction, 0.8, hackScript, growScript, weakenScript, maxCPU, isFormula);
-        let sortedBatches = getSortedLimitedBatchArrayDynamic(batchesLimit, workers, maxTarget, true)
+        let sortedBatches = getSortedLimitedBatchArrayDynamic(batches, workers, false)
         let totalBatchesMem = sortedBatches.reduce((total, { batch }) => total + ((batch.batchMatrix[0][0]?.batchRam) || 0), 0);
         let maxAmountBatch = calcMaxParallelBatches(totalAvailableMem, totalBatchesMem);
 
@@ -130,7 +140,7 @@ export async function main(ns) {
         if(maxAmountBatch === 0 && totalMaxsMem < totalBatchesMem * 2) {
             hackFraction = Math.max(MIN_HACK_FRACTION, hackFraction * 0.9 * (totalAvailableMem / totalBatchesMem))
             batches = getBatchPlan(ns, status.ok.map(s=>s.host), hackFraction, 0.8, hackScript, growScript, weakenScript, maxCPU, isFormula)
-            sortedBatches = getSortedLimitedBatchArrayDynamic(batchesLimit, workers, maxTarget, true)
+            sortedBatches = getSortedLimitedBatchArrayDynamic(batches, workers, false)
             totalBatchesMem = sortedBatches.reduce((total, { batch }) => total + ((batch.batchMatrix[0][0]?.batchRam) || 0), 0)
             maxAmountBatch = calcMaxParallelBatches(totalAvailableMem, totalBatchesMem)
         }
@@ -142,7 +152,7 @@ export async function main(ns) {
         );
 
         // ---- 5. Assign and launch
-        const batchAssignments = assignAllBatchesWithWindows(ns, sortedBatches, workers, maxAmountBatch, "round");
+        const batchAssignments = assignAllBatchesWithWindows(ns, sortedBatches, workers);
         let batchFailures = await launchMultiBatches(ns, batchAssignments);
 
         // ---- 6. Reporting
@@ -151,6 +161,11 @@ export async function main(ns) {
         const moneyNeeded = preppingArr.reduce((a, r) => a + (Number(r.moneyNeeded) || 0), 0);
         const secToReduce = preppingArr.reduce((a, r) => a + (Number(r.secToReduce) || 0), 0);
         const { minBatches, maxBatches, totalBatches } = getBatchWindowStats();
+        const opsMeans = getMeanLandingsAllTargets()
+        const maxWeakenTime = sortedBatches.length ? Math.max(...sortedBatches.map(m => m.weakenTime)) : 0;
+        const retargetAfter = retargetInterval - cycleCount % retargetInterval 
+        resourceAdjustment(ns, servers, freeMem, totalMem)
+
         printWorkerThreadSummary(ns, workers);
         ns.print(buildStatusString({
             moneyHosts,
@@ -167,6 +182,9 @@ export async function main(ns) {
             batchFailures,
             totalMem,
             freeMem,
+            opsMeans,
+            maxWeakenTime,
+            retargetAfter,
         }));
 
         if (debug) {
@@ -205,17 +223,20 @@ function buildStatusString({
     batchFailures,
     totalMem,
     freeMem,
+    opsMeans,
+    maxWeakenTime,
+    retargetAfter,
 }) {
     return [
-        `[${(new Date()).toLocaleTimeString()}] Batch Cycle`,
+        `[${(new Date()).toLocaleTimeString()}] Batch Cycle | Workers: ${workers.length} | WTime: ${(maxWeakenTime/1000).toFixed(0)}`,
         `Targets: ${moneyHosts.length} | sortedBatches: ${batchData.sortedBatches.length}, first: ${batchData.sortedBatches?.[0]?.target ?? "(no target)"}`,
-        `  Ready: ${status.ok.length} | Prepping: ${preppingArr.length}`,
+        `  Ready: ${status.ok.length} | Prepping: ${preppingArr.length} | Retarget: ${retargetAfter}`,
         `  $ Needed: ${shortNum(moneyNeeded)} | Sec to Reduce: ${secToReduce.toFixed(2)}`,
-        `Workers: ${workers.length} | Parallel/target: ${batchData.maxAmountBatch} `,
-        `[BATCH]T: ${totalBatches} | Min/Max: ${minBatches}/${maxBatches} | ` +
-        `CurB: ${batchAssignments.length}, hFract: ${batchData.hackFraction}`,
-        `RAM: Used ${(totalMem - freeMem).toFixed(1)} | Free: ${freeMem.toFixed(1)} GB | ${totalMem.toFixed(1)} GB`,
-        `. BatchMem: ${batchData.totalBatchesMem.toFixed(1)} GB/MinBatchMem: ${batchData.minBatchesMem.toFixed(1)} GB` +
+        `[BATCH]T: ${totalBatches} | Min/Max: ${minBatches}/${maxBatches}/(${MAX_TOTAL_BATCHES})| ` +
+        `CurB: ${batchAssignments.length}, hFract: ${batchData.hackFraction.toFixed(3)}`,
+        `RAM: Used ${(totalMem - freeMem).toFixed(1)} | Free: ${freeMem.toFixed(1)} GB | ${totalMem.toFixed(1)} GB| FMin: ${(getMinFreeMem()/totalMem*100).toFixed(1)}% `,
+        `. BatchMem: ${batchData.totalBatchesMem.toFixed(1)} GB/MinBatchMem: ${batchData.minBatchesMem.toFixed(1)} GB`,
+        `hMean: ${opsMeans.hack.toFixed(1)}, grow:${opsMeans.grow.toFixed(1)}, weakenH: ${opsMeans.weakenH.toFixed(1)}, weakenG:${opsMeans.weakenG.toFixed(1)} ` +
         (batchFailures > 0 ? ` | ⚠️ Skipped: ${batchFailures}` : "")
     ].join('\n');
 }
@@ -355,9 +376,11 @@ function getBatchPlan(
         const weakenHOffset = weakenHLanding - weakenTime;
         const growOffset    = growLanding    - growTime;
         const weakenGOffset = weakenGLanding - weakenTime;
-                
-        const GROW_MULTIPLIER = Math.max(1, parallelBatches * GROW_THREADS_COMP_MULT)
-        const WEAKEN_MULTIPLIER = Math.max(1, parallelBatches * WEAKEN_THREADS_COMP_MULT)
+        
+        const GROW_MULTIPLIER = 1 + Math.sqrt(parallelBatches - 1) * GROW_THREADS_COMP_MULT;  
+        const WEAKEN_MULTIPLIER = 1 + Math.sqrt(parallelBatches - 1) * WEAKEN_THREADS_COMP_MULT;      
+        //const GROW_MULTIPLIER = Math.max(1, parallelBatches * GROW_THREADS_COMP_MULT)
+        //const WEAKEN_MULTIPLIER = Math.max(1, parallelBatches * WEAKEN_THREADS_COMP_MULT)
 
         // Precompute grow/weaken matrices
         const batchMatrix = [];
@@ -411,7 +434,9 @@ function getBatchPlan(
             }
            
         }
-      
+        
+        BATCH_WINDOW[hostname] = Math.ceil(Math.max(BATCH_WINDOW_MS, weakenTime / MAX_TOTAL_BATCHES)/10)*10
+
         result[hostname] = {
             server: hostname,
             maxMoney,
@@ -657,7 +682,7 @@ export function getTargetRecoveryStatus(ns, targets, moneyFrac = 0.9, secBuffer 
  */
 export function calcMaxParallelBatches(totalAvailableMem, batchRam) {
     if (batchRam <= 0) return 0;
-    return Math.min(Math.floor(totalAvailableMem / batchRam), Math.floor(BATCH_PAUSE/BATCH_WINDOW_MS));
+    return Math.min(Math.floor(totalAvailableMem / batchRam), MAX_TOTAL_BATCHES);
 }
 
 /**
@@ -713,9 +738,6 @@ export function getTopProfitServers(ns, servers, topN, isFormulaAvailable) {
     // Sort by profit descending
     serversWithProfit.sort((a, b) => b.profitPerThreadPerSec - a.profitPerThreadPerSec);
 
-    // Optionally print debug output
-    // ns.printf("servers profit: %j", serversWithProfit);
-
     // Return top N hostnames
     return serversWithProfit.slice(0, topN).map(s => s.hostname);
 }
@@ -736,10 +758,10 @@ function countActiveThreads(ns, workers, scriptName, target) {
 function canScheduleBatch(target, landings) {
     if (!batchWindows[target]) return true;
     for (const batch of batchWindows[target]) {
-        if (Math.abs(landings.hack - batch.hack) < BATCH_WINDOW_MS) return false;
-        if (Math.abs(landings.grow - batch.grow) < BATCH_WINDOW_MS) return false;
-        if (Math.abs(landings.weakenH - batch.weakenH) < BATCH_WINDOW_MS) return false;
-        if (Math.abs(landings.weakenG - batch.weakenG) < BATCH_WINDOW_MS) return false;
+        if (Math.abs(landings.hack - batch.hack) < BATCH_WINDOW[target]) return false;
+        if (Math.abs(landings.grow - batch.grow) < BATCH_WINDOW[target]) return false;
+        if (Math.abs(landings.weakenH - batch.weakenH) < BATCH_WINDOW[target]) return false;
+        if (Math.abs(landings.weakenG - batch.weakenG) < BATCH_WINDOW[target]) return false;
     }
     return true;
 }
@@ -766,6 +788,36 @@ function getBatchWindowStats() {
     };
 }
 
+/**
+ * Calculates mean landing times for each operation across all targets and batches.
+ * @returns {object|null} { hack: mean, grow: mean, weakenH: mean, weakenG: mean } or null if no data.
+ */
+function getMeanLandingsAllTargets() {
+    const now = Date.now()
+    const ops = ['hack', 'grow', 'weakenH', 'weakenG'];
+    const totals = { hack: 0, grow: 0, weakenH: 0, weakenG: 0 };
+    let count = 0;
+
+    for (const target in batchWindows) {
+        const batches = batchWindows[target];
+        if (!batches || batches.length === 0) continue;
+        for (const batch of batches) {
+            for (const op of ops) {
+                const wait = batch[op] - now
+                totals[op] += wait > 0? wait/1000 : 0;
+            }
+            count++;
+        }
+    }    
+    const means = {};
+    for (const op of ops) {
+        means[op] = (count === 0 ? 0: totals[op] / count);
+    }
+    return means;
+}
+
+
+
 
 /**
  * Attempts to assign as many batches as possible per target, honoring window, RAM, and cores.
@@ -777,7 +829,7 @@ function getBatchWindowStats() {
  * @param {number} maxBatchesPerTarget
  * @returns {Array} batchAssignments [{server, batchNum, assignments, offsets}]
  */
-function assignAllBatchesWithWindows(ns, batches, workers, maxBatchesPerTarget, mode = "fill") {
+function assignAllBatchesWithWindows(ns, batches, workers) {
     const now = Date.now();
     pruneOldBatches(now);
 
@@ -785,139 +837,53 @@ function assignAllBatchesWithWindows(ns, batches, workers, maxBatchesPerTarget, 
     const perTargetBatchCount = {};
     for (const {target} of batches) perTargetBatchCount[target] = 0;
     
-    if (mode === "fill") {
-        for (const {target, batch} of batches) {
-            
-            const batchTemplate = batch;
-            let batchNum = 0;
-                
-            const maxTotalBatches = Math.floor(batchTemplate.weakenTime / BATCH_WINDOW_MS);
-
-            let batchDuration = batchTemplate.weakenTime; // ms
-        
-            if ((batchWindows[target]?.length || 0) >= maxTotalBatches) {
-                continue;
-            } 
-            const max_batches = Math.min(MAX_TOTAL_BATCHES - (batchWindows[target]?.length || 0), maxTotalBatches - (batchWindows[target]?.length || 0), maxBatchesPerTarget, Math.floor(batchDuration / BASE_OFFSET));        
-        
-            // Try from highest to lowest cores, to maximize batch quality
-            const growCoreMax = batchTemplate.batchMatrix.length;
-            
-            for (let cores = growCoreMax; cores >= 1; cores--) {                
-                    let scheduledBatches = 0;
-                    while (scheduledBatches < max_batches) {
-                        let extraOffset = 0, tries = 0, scheduled = false;
-                        // Pick stats for this (growCores, weakenCores)
-                        let stats = batchTemplate.batchMatrix[cores - 1][cores - 1]; // square fallback
-                        if (!stats) break; // if no such entry
-
-                        while (tries < OFFEST_MAX_TRIES && !scheduled) {
-                            // Calculate offsets
-                            const hackOffset = stats.hackOffset + batchNum * BASE_OFFSET + extraOffset;
-                            const growOffset = stats.growOffset + batchNum * BASE_OFFSET + extraOffset;
-                            const weakenHOffset = stats.weakenHOffset + batchNum * BASE_OFFSET + extraOffset;
-                            const weakenGOffset = stats.weakenGOffset + batchNum * BASE_OFFSET + extraOffset;
-
-                            // Calculate landing times
-                            const hackLand    = now + hackOffset    + batchTemplate.hackTime;
-                            const growLand    = now + growOffset    + batchTemplate.growTime;
-                            const weakenHLand = now + weakenHOffset + batchTemplate.weakenTime;
-                            const weakenGLand = now + weakenGOffset + batchTemplate.weakenTime;
-                            const landings = { hack: hackLand, grow: growLand, weakenH: weakenHLand, weakenG: weakenGLand };
-                                                
-                            // Check window
-                            if (canScheduleBatch(target, landings)) {
-                                // Attempt assignment
-                                const { assignments, canAssign } = tryAssignBatchWithOffsets(
-                                    ns, batchTemplate, workers, stats,
-                                    hackOffset, growOffset, weakenHOffset, weakenGOffset
-                                );
-                                if (canAssign) {                            
-                                    batchAssignments.push({
-                                        server: target,
-                                        batchNum,
-                                        assignments,
-                                        offsets: { hackOffset, growOffset, weakenHOffset, weakenGOffset }
-                                    });
-                                    recordBatch(target, landings);
-                                    scheduled = true;
-                                    break;
-                                } else {
-                                    if(debug) {
-                                        ns.print(`${target}can not assign batch with offset : ${extraOffset}`)
-                                    }
-                                }
-
-                            } else {
-                                    if(debug) {
-                                        ns.print(`${target}can not schedule batch with landing : ${JSON.stringify(landings)}`)
-                                    }
-                            }
-                            // Slide forward in time
-                            extraOffset += BATCH_WINDOW_MS;
-                            tries++;        
-                        }            
-                        if (!scheduled) {                    
-                            break; // Can't schedule more with this core count
-                        } 
-                        batchNum++;
-                        scheduledBatches++;
-                }            
-            }        
-        }
-        return batchAssignments;
-    }
-
-    
-     // ROUND ROBIN MODE
+    // ROUND ROBIN MODE
     // Step 1: Prepare each target's max_batches as before
     const targetBatchLimits = {};
-
-    let totalRunning = 0;
-    let totalAllowed = 0;
-    let totalTargets = batches.length;
-    let hittingCap = 0;
-    let windowLimits = [];
-    let offsetLimits = [];
-    let hardCaps = [];
-
-
+    const capDiagnostics = {};
+    let allFull = true;    
     for (const { target, batch } of batches) {
-        const batchTemplate = batch;
-        const maxTotalBatches = Math.floor(batchTemplate.weakenTime / BATCH_WINDOW_MS);
-        targetBatchLimits[target] = Math.min(
-            MAX_TOTAL_BATCHES - (batchWindows[target]?.length || 0),
-            maxTotalBatches - (batchWindows[target]?.length || 0),
-            //maxBatchesPerTarget,
-            Math.floor(batchTemplate.weakenTime / BASE_OFFSET) - (batchWindows[target]?.length || 0)
-        );
+         const running = batchWindows[target]?.length || 0;
+        const windowLimit = Math.floor(batch.weakenTime / BATCH_WINDOW[target]) - running;
+        const hardCap    = MAX_TOTAL_BATCHES - running;
 
-        const running = batchWindows[target]?.length || 0;
-        const windowLimit = Math.floor(batch.weakenTime / BATCH_WINDOW_MS);
-        const offsetLimit = Math.floor(batch.weakenTime / BASE_OFFSET);
-        const hardCap = MAX_TOTAL_BATCHES - running;
+        const limit = Math.min(windowLimit, hardCap);
+        targetBatchLimits[target] = limit;
 
-        const allowed = Math.min(windowLimit, offsetLimit, hardCap);
+        capDiagnostics[target] = {
+            windowLimit,
+            hardCap,
+            running,
+            reason: "",
+        };
 
-        windowLimits.push(windowLimit);
-        offsetLimits.push(offsetLimit);
-        hardCaps.push(hardCap);
+        if (windowLimit <= 0 && hardCap <= 0) {
+            capDiagnostics[target].reason = "both";
+        } else if (windowLimit <= 0) {
+            capDiagnostics[target].reason = "windowLimit";
+        } else if (hardCap <= 0) {
+            capDiagnostics[target].reason = "hardCap";
+        } else {
+            capDiagnostics[target].reason = "";
+        }
 
-        totalRunning += running;
-        totalAllowed += allowed;
-        if (allowed < windowLimit) hittingCap++;
+        if (limit > 0) {
+            allFull = false;
+        }
     }
-    // Aggregate stats
-    const avgWindow = (windowLimits.reduce((a, b) => a + b, 0) / windowLimits.length).toFixed(1);
-    const maxWindow = Math.max(...windowLimits);
-    const capAlert = hittingCap > 0 ? `| ⚠️ ${hittingCap}/${totalTargets} at hard cap!` : '';
 
-    if (hittingCap > Math.max(totalTargets - 1 , 1)) {
-        ns.print(
-            `[BATCHES] Running: ${totalRunning} | Allowed: ${totalAllowed} | WindowAvg: ${avgWindow} | WindowMax: ${maxWindow} | Targets: ${totalTargets} ${capAlert}`
-        );
+    // Alert if all targets are full
+    if (allFull) {
+        let windowLimitCount = 0, hardCapCount = 0, bothCount = 0;
+        for (const info of Object.values(capDiagnostics)) {
+            if (info.reason === "both") bothCount++;
+            else if (info.reason === "windowLimit") windowLimitCount++;
+            else if (info.reason === "hardCap") hardCapCount++;
+        }
+        ns.print(`[CRITICAL] ⚠️ All targets at capacity. Blocked by: windowLimit=${windowLimitCount}, hardCap=${hardCapCount}, both=${bothCount}`);
     }
-    // Step 2: Loop round-robin until no more can be scheduled
+
+     // Step 2: Loop round-robin until no more can be scheduled
     let madeAssignment = true;
     let batchNums = {}; // Track per-target batchNum for offset
     for (const {target} of batches) batchNums[target] = 0;
@@ -929,60 +895,74 @@ function assignAllBatchesWithWindows(ns, batches, workers, maxBatchesPerTarget, 
             if (perTargetBatchCount[target] >= targetBatchLimits[target]) {
                 continue;
             }
-
+            const OFFEST_MAX_TRIES = Math.min(Math.max(1, Math.ceil(BATCH_PAUSE / BATCH_WINDOW[target]) - 1), MAX_TOTAL_BATCHES) // we can try to fill a whole pause window - one BATCH_WINDOW gap
             const batchTemplate = batch;
             const batchNum = batchNums[target];
             const growCoreMax = batchTemplate.batchMatrix.length;
-
+            let scheduleBatch = false;
             let scheduled = false;
 
             for (let cores = growCoreMax; cores >= 1 && !scheduled; cores--) {
-                    let stats = batchTemplate.batchMatrix[cores - 1][cores - 1];
-                    if (!stats) continue;
-                    let tries = 0, extraOffset = 0;
-                    while (tries < OFFEST_MAX_TRIES && !scheduled) {
-                        // Offsets and landings as before
-                        const hackOffset = stats.hackOffset + batchNum * BASE_OFFSET + extraOffset;
-                        const growOffset = stats.growOffset + batchNum * BASE_OFFSET + extraOffset;
-                        const weakenHOffset = stats.weakenHOffset + batchNum * BASE_OFFSET + extraOffset;
-                        const weakenGOffset = stats.weakenGOffset + batchNum * BASE_OFFSET + extraOffset;
-                        const hackLand    = now + hackOffset    + batchTemplate.hackTime;
-                        const growLand    = now + growOffset    + batchTemplate.growTime;
-                        const weakenHLand = now + weakenHOffset + batchTemplate.weakenTime;
-                        const weakenGLand = now + weakenGOffset + batchTemplate.weakenTime;
-                        const landings = { hack: hackLand, grow: growLand, weakenH: weakenHLand, weakenG: weakenGLand };
+                let stats = batchTemplate.batchMatrix[cores - 1][cores - 1];
+                if (!stats) continue;
+                let tries = 0, extraOffset = 0;
+                scheduled = false;
+                while (tries < OFFEST_MAX_TRIES && !scheduled) {
+                    // Offsets and landings as before
+                    const baseBatchOffset = batchNum * BATCH_WINDOW[target] + extraOffset;
+                    const hackOffset = stats.hackOffset + baseBatchOffset;
+                    const growOffset = stats.growOffset + baseBatchOffset;
+                    const weakenHOffset = stats.weakenHOffset + baseBatchOffset;
+                    const weakenGOffset = stats.weakenGOffset + baseBatchOffset;
+                    const hackLand = now + hackOffset + batchTemplate.hackTime;
+                    const growLand = now + growOffset + batchTemplate.growTime;
+                    const weakenHLand = now + weakenHOffset + batchTemplate.weakenTime;
+                    const weakenGLand = now + weakenGOffset + batchTemplate.weakenTime;
+                    const landings = { hack: hackLand, grow: growLand, weakenH: weakenHLand, weakenG: weakenGLand };
 
-                        if (canScheduleBatch(target, landings)) {
-                            const { assignments, canAssign } = tryAssignBatchWithOffsets(
-                                ns, batchTemplate, workers, stats,
-                                hackOffset, growOffset, weakenHOffset, weakenGOffset
-                            );
-                            if (canAssign) {
-                                batchAssignments.push({
-                                    server: target,
-                                    batchNum,
-                                    assignments,
-                                    offsets: { hackOffset, growOffset, weakenHOffset, weakenGOffset }
-                                });
-                                recordBatch(target, landings);
-                                perTargetBatchCount[target]++;
-                                batchNums[target]++;
-                                madeAssignment = true;
-                                scheduled = true;
-                                break;
-                            } else {
-                                if(debug) {
-                                    const weakenScript = ns.getScriptRam("worker-weaken.js")
-                                    if (cores == 1 && stats.batchRam < 1.1*workers.map(w => w.availableMem).filter(m => m >= weakenScript).reduce((a, b) => a + b, 0)) {
-                                        ns.tprint(`workers: ${JSON.stringify(workers)}`)
-                                        ns.tprint(`can not assign stats: ${JSON.stringify(stats)}`)
-                                    }
-                                }
+                    if (!canScheduleBatch(target, landings)) {
+                        extraOffset += BATCH_WINDOW[target];
+                        tries++;
+                        continue; // Try next offset
+                    } else {
+                        scheduleBatch = true; //we do not need alert if there is no free memory
+                    }
+
+                    const { assignments, canAssign } = tryAssignBatchWithOffsets(
+                        ns, batchTemplate, workers, stats,
+                        hackOffset, growOffset, weakenHOffset, weakenGOffset
+                    );
+                    if (canAssign) {
+                        batchAssignments.push({
+                            server: target,
+                            batchNum,
+                            assignments,
+                            offsets: { hackOffset, growOffset, weakenHOffset, weakenGOffset }
+                        });
+                        recordBatch(target, landings);
+                        perTargetBatchCount[target]++;
+                        batchNums[target]++;
+                        madeAssignment = true;
+                        scheduled = true;
+                        break;
+                    } else {
+                        if (debug) {
+                            const weakenScript = ns.getScriptRam("worker-weaken.js")
+                            if (cores == 1 && stats.batchRam < 1.1 * workers.map(w => w.availableMem).filter(m => m >= weakenScript).reduce((a, b) => a + b, 0)) {
+                                ns.tprint(`workers: ${JSON.stringify(workers)}`)
+                                ns.tprint(`can not assign stats: ${JSON.stringify(stats)}`)
                             }
                         }
-                        extraOffset += BATCH_WINDOW_MS;
-                        tries++;
-                }
+                        break;
+                    }
+                } 
+            }
+            if (!scheduleBatch && (!batchWindows[target] || batchWindows[target].length === 0)) {
+                ns.tprint(`[DEBUG] batchWindows[${target}]: ` + JSON.stringify(batchWindows[target]));
+                ns.tprint(`[ALERT] ${target}: No batches in flight, but can't schedule new batch!`);
+                // Add diagnostics here:
+                ns.tprint(`[DIAG] batchMatrix[cores-1][cores-1]: ${JSON.stringify(stats)}`);
+                ns.tprint(`[DIAG] RAM needed: ${stats ? stats.batchRam : 'n/a'}, worker RAMs: ${workers.map(w=>w.availableMem)}`);
             }
         }
     }
@@ -1190,12 +1170,12 @@ function shouldPrepHost(host) {
  * @param {number} maxBatchesPerTarget - planned parallel batches per target
  * @returns {Array<{target: string, batch: Object, profitPerGbPerSec: number, weakenTime: number}>}
  */
-function getSortedLimitedBatchArrayDynamic(batches, workers, maxBatchesPerTarget, isRamLimit = false) {
+function getSortedLimitedBatchArrayDynamic(batches, workers, isRamLimit = false) {
     // Compute total available RAM across all workers
     const totalAvailableRam = workers.reduce((sum, w) => sum + (w.availableMem || 0), 0);
 
     // Build batch meta
-    const meta = Object.entries(batches).map(([target, batch]) => {
+    let meta = Object.entries(batches).map(([target, batch]) => {
         const maxCore = batch.batchMatrix.length - 1;
         const stats = batch.batchMatrix[maxCore][maxCore];
         // RAM needed for a single batch (take lowest found, for safety)
@@ -1209,19 +1189,19 @@ function getSortedLimitedBatchArrayDynamic(batches, workers, maxBatchesPerTarget
         };
     }).filter(t =>
         t.profitPerGbPerSec > 0 &&
-        t.weakenTime < MAX_BATCH_TIME &&
+       // t.weakenTime < MAX_BATCH_TIME &&
         isFinite(t.batchRam) && t.batchRam > 0
     );
     
     // Sort by profit
-    meta.sort((a, b) => b.profitPerGbPerSec - a.profitPerGbPerSec);
+    meta = meta.sort((a, b) => b.profitPerGbPerSec - a.profitPerGbPerSec).slice(0, MAX_TARGET_COUNT);
     if(!isRamLimit) return meta;
     // Now, dynamically limit the number of targets
     let runningRam = 0;
     const limited = [];
     for (const entry of meta) {
         // If we include this target, how much RAM will we need for max batches?
-        const needRam = entry.batchRam * maxBatchesPerTarget;
+        const needRam = entry.batchRam * MAX_TOTAL_BATCHES;
         if (runningRam + needRam > totalAvailableRam) {
             limited.push(entry); // let's add one more
             break; // No more room!
@@ -1290,19 +1270,21 @@ let lastAutoTuneSummary = '';
  * Auto-tune GROW/WEAKEN multipliers based on global thread prep stats
  * Call from your main loop
  */
-function autoTuneMultipliers(ns) {
+function autoTuneMultipliers(ns, workers, servers, isFormulaAvailable) {
     // Gather stats as before ...
     let growPrep = 0, weakenPrep = 0;
     let gRunning = 0, wRunning = 0;
-    const workers = getUsableHosts(ns, scanAllServers(ns));
+  
     for (const host in prepInFlightMap) {
-        if (prepInFlightMap[host].grow)
-            growPrep += prepInFlightMap[host].grow.reduce((a, b) => a + b.threads, 0);
-        if (prepInFlightMap[host].weaken)
-            weakenPrep += prepInFlightMap[host].weaken.reduce((a, b) => a + b.threads, 0);
+        if(prepInFlightMap[host]) {
+            if (Array.isArray(prepInFlightMap[host].grow))
+                growPrep += prepInFlightMap[host].grow.reduce((a, b) => a + b.threads, 0);
+            if (Array.isArray(prepInFlightMap[host].weaken))
+                weakenPrep += prepInFlightMap[host].weaken.reduce((a, b) => a + b.threads, 0);
+        }
     }
     for (const w of workers) {
-        for (const proc of ns.ps(w.host)) {
+        for (const proc of ns.ps(w.host) || []) {
             if (proc.filename === 'worker-grow.js') gRunning += proc.threads;
             else if (proc.filename === 'worker-weaken.js') wRunning += proc.threads;
         }
@@ -1329,32 +1311,36 @@ function autoTuneMultipliers(ns) {
     }
     const growStd = stddev(growPrepPctHistory);
     const weakenStd = stddev(weakenPrepPctHistory);
-    const growMean = growPrepPctHistory.reduce((a, b) => a + b, 0) / growPrepPctHistory.length || 0;
-    const weakenMean = weakenPrepPctHistory.reduce((a, b) => a + b, 0) / weakenPrepPctHistory.length || 0;
+    const growMean = growPrepPctHistory.length
+                        ? growPrepPctHistory.reduce((a, b) => a + b, 0) / growPrepPctHistory.length || 0 : 0;
+    const weakenMean = weakenPrepPctHistory.length
+                        ? weakenPrepPctHistory.reduce((a, b) => a + b, 0) / weakenPrepPctHistory.length || 0 : 0;
 
     // --- Adjust frequency and amplitude ---
     // "Noisy" means either high variance or far from target
-    function farFromTarget(mean) {
-        return Math.abs(mean - TARGET_PREP_PCT) > 10;
+    function farFromTarget(mean, mult) {
+        return Math.abs(mean - TARGET_PREP_PCT) > 10 || (mean <= 1 && mult >0);
     }
     function isNoisy(std) {
         return std > 4; // More than 4% stddev in history
     }
+    let growStep = 0.02; // Start with ±2%
+    let weakenStep = 0.02;
 
     // Set step and period for grow
-    if (farFromTarget(growMean) || isNoisy(growStd)) {
-        growStep = 0.02; // ±2%
+    if (farFromTarget(growMean, GROW_THREADS_COMP_MULT) || isNoisy(growStd)) {
+        growStep = 0.04; // ±2%
         autoTunePeriod = MULTI_ADJUST_NOISE_PERIOD; // 1 min
     } else {
-        growStep = 0.01; // ±1%
+        growStep = 0.02; // ±1%
         autoTunePeriod = MULTI_ADJUST_CALM_PERIOD; // 3 min
     }
     // Same for weaken
-    if (farFromTarget(weakenMean) || isNoisy(weakenStd)) {
-        weakenStep = 0.04; //less threads more need for adjustments
+    if (farFromTarget(weakenMean, WEAKEN_THREADS_COMP_MULT) || isNoisy(weakenStd)) {
+        weakenStep = 0.08; //less threads more need for adjustments
         autoTunePeriod = Math.min(autoTunePeriod, MULTI_ADJUST_NOISE_PERIOD);
     } else {
-        weakenStep = 0.01;
+        weakenStep = 0.04;
         autoTunePeriod = Math.min(autoTunePeriod, MULTI_ADJUST_CALM_PERIOD);
     }
 
@@ -1362,42 +1348,167 @@ function autoTuneMultipliers(ns) {
     const now = Date.now();
     if (now - lastTuneTime < autoTunePeriod) {
         lastAutoTuneSummary =
-          `[AutoTune](${Math.round((autoTunePeriod - (now - lastTuneTime))/1000)}s/${autoTunePeriod/1000}s) `
+          `[AutoTune](${Math.round((autoTunePeriod - (now - lastTuneTime))/1000)}s/${autoTunePeriod/1000}s/${Math.max(((BATCH_ADJUST_PAUSE - (now - lastBatchTime))/1000).toFixed(0),0)}s) `
           + `GPrep:${growMean.toFixed(2)}(${growPrepPct.toFixed(1)}%) WPrep:${weakenMean.toFixed(2)}(${weakenPrepPct.toFixed(1)}%)\n`
           + `GrowMult:${GROW_THREADS_COMP_MULT.toFixed(2)} WeakenMult:${WEAKEN_THREADS_COMP_MULT.toFixed(2)} | `
-          + `GStep:${growStep*100}% WStep:${weakenStep*100}%`;
+          + `GStep:${growStep*100}% WStep:${(weakenStep*100).toFixed(0)}%`;
         return;
     }
     lastTuneTime = now;
 
     // Grow adjustment
     // Use mean for regular tuning:
-    if (growMean > TARGET_PREP_PCT) {
-        GROW_THREADS_COMP_MULT *= 1 + growStep;
-    } else if (growMean < INCREASE_IF_BELOW) {
-        GROW_THREADS_COMP_MULT *= 1 - growStep;
+    if(growPrepPct<=60.0) {  
+        if (growMean > TARGET_PREP_PCT) {
+            GROW_THREADS_COMP_MULT +=  growStep;
+        } else if (growMean < INCREASE_IF_BELOW) {
+            GROW_THREADS_COMP_MULT -= growStep;
+        }
+        // "Emergency" tuning if there's a huge spike
+        if (growPrepPct > TARGET_PREP_PCT * 2) {
+            GROW_THREADS_COMP_MULT += 0.14; // Fast bump
+        }
     }
-    // "Emergency" tuning if there's a huge spike
-    if (growPrepPct > TARGET_PREP_PCT * 2) {
-        GROW_THREADS_COMP_MULT *= 1.14; // Fast bump
-    }
-    GROW_THREADS_COMP_MULT = Math.max(0.2, Math.min(GROW_THREADS_COMP_MULT, 3.0));
+    GROW_THREADS_COMP_MULT = Math.max(0.0, Math.min(GROW_THREADS_COMP_MULT, 2.0));
 
-    // Weaken adjustment
-    if (weakenMean > TARGET_PREP_PCT) {
-        WEAKEN_THREADS_COMP_MULT *= 1 + weakenStep;
-    } else if (weakenMean < INCREASE_IF_BELOW) {
-        WEAKEN_THREADS_COMP_MULT *= 1 - weakenStep;
+    if(weakenPrepPct<=60.0) {
+       // Weaken adjustment
+        if (weakenMean > TARGET_PREP_PCT) {
+            WEAKEN_THREADS_COMP_MULT += Math.max(weakenStep, WEAKEN_THREADS_COMP_MULT*weakenStep);
+        } else if (weakenMean < INCREASE_IF_BELOW) {
+            WEAKEN_THREADS_COMP_MULT -= Math.max(weakenStep, WEAKEN_THREADS_COMP_MULT*weakenStep);;
+        }
+        // "Emergency" tuning if there's a huge spike
+        if (weakenPrepPct > TARGET_PREP_PCT * 2) {
+            WEAKEN_THREADS_COMP_MULT += 0.14; // Fast bump
+        }
     }
-     // "Emergency" tuning if there's a huge spike
-    if (weakenPrepPct > TARGET_PREP_PCT * 2) {
-        WEAKEN_THREADS_COMP_MULT *= 1.14; // Fast bump
-    }
-    WEAKEN_THREADS_COMP_MULT = Math.max(0.5, Math.min(WEAKEN_THREADS_COMP_MULT, 6.0));
-
+    WEAKEN_THREADS_COMP_MULT = Math.max(0.0, Math.min(WEAKEN_THREADS_COMP_MULT, 3.0));
+     
     lastAutoTuneSummary =
-      `[AutoTune](${Math.round(autoTunePeriod/1000)}s) GPrep:${growPrep} (${growPrepPct.toFixed(1)}%) WPrep:${weakenPrep} (${weakenPrepPct.toFixed(1)}%)\n`
-      + `GMean:${growMean.toFixed(1)} GStd:${growStd.toFixed(2)} GStep:${(growStep*100).toFixed(1)}%\n`
-      + `WMean:${weakenMean.toFixed(1)} WStd:${weakenStd.toFixed(2)} WStep:${(weakenStep*100).toFixed(1)}%\n`
-      + `GrowMult:${GROW_THREADS_COMP_MULT.toFixed(2)} WeakenMult:${WEAKEN_THREADS_COMP_MULT.toFixed(2)} `;
+        `[AutoTune](${Math.round(autoTunePeriod / 1000)}s) GPrep:${growPrep} (${growPrepPct.toFixed(1)}%) WPrep:${weakenPrep} (${weakenPrepPct.toFixed(1)}%)\n`
+        + `GMean:${growMean.toFixed(1)} GStd:${growStd.toFixed(2)} GStep:${(growStep * 100).toFixed(1)}%\n`
+        + `WMean:${weakenMean.toFixed(1)} WStd:${weakenStd.toFixed(2)} WStep:${(weakenStep * 100).toFixed(1)}%\n`
+        + `GrowMult:${GROW_THREADS_COMP_MULT.toFixed(2)} WeakenMult:${WEAKEN_THREADS_COMP_MULT.toFixed(2)} `;
+}
+
+/**
+ * Stores the latest free memory value in a rolling history.
+ * @param {number} freeMem - The current free memory value (e.g., GB).
+ */
+function recordFreeMem(freeMem) {
+    freeMemHistory.push(freeMem);
+    if (freeMemHistory.length > FREE_MEM_HISTORY_WINDOW) {
+        freeMemHistory.shift(); // Remove oldest entry
+    }
+}
+
+/**
+ * Returns the average free memory from the rolling history.
+ * @returns {number|null} The average, or null if not enough data.
+ */
+function getAvgFreeMem() {
+    if (freeMemHistory.length === 0) return 0;
+    const sum = freeMemHistory.reduce((a, b) => a + b, 0);
+    return sum / freeMemHistory.length;
+}
+
+/**
+ * Returns the average free memory from the rolling history.
+ * @returns {number|null} The average, or null if not enough data.
+ */
+function getMinFreeMem() {
+    if (freeMemHistory.length === 0) return 0;    
+    return Math.min(...freeMemHistory)
+}
+
+
+/**
+ * Finds the host with the smallest weakenTime > MAX_BATCH_TIME,
+ * updates MAX_BATCH_TIME (ceil), returns true if found, else false.
+ * Uses formulas if available and idealServer state.
+ * 
+ * @param {NS} ns - Bitburner NS object
+ * @param {Array} hostnames - Array of host names (strings)
+ * @param {boolean} isFormulaAvailable - Whether formulas are available
+ * @returns {boolean}
+ */
+function findAndUpdateMaxBatchTime(ns, hostnames, isFormulaAvailable) {
+    let minWeakenTime = Infinity;
+    let found = false;
+
+    const player = ns.getPlayer();
+
+    for (const host of hostnames) {
+        let wTime;
+        if (isFormulaAvailable && ns.formulas && ns.formulas.hacking) {
+            const idealServer = {
+                ...ns.getServer(host),
+                moneyAvailable: ns.getServerMaxMoney(host),
+                hackDifficulty: ns.getServerMinSecurityLevel(host)
+            };
+            wTime = ns.formulas.hacking.weakenTime(idealServer, player);
+        } else {
+            wTime = ns.getWeakenTime(host);
+        }
+
+        if (wTime > MAX_BATCH_TIME && wTime < minWeakenTime) {
+            minWeakenTime = wTime;
+            found = true;
+        }
+    }
+    if (found) {
+        MAX_BATCH_TIME = Math.ceil(minWeakenTime);
+        return true;
+    }
+    return false;
+}
+
+
+function resourceAdjustment(ns, servers, totalAvailableMem, totalMaxsMem) {
+    const now = Date.now();
+    recordFreeMem(totalAvailableMem);
+    if (now - lastBatchTime > BATCH_ADJUST_PAUSE) {
+        lastBatchTime = now
+
+        if (getMinFreeMem() < (totalMaxsMem * 0.15)) {
+            const pid = ns.run("purchase.js")
+            if (pid == 0) {
+                ns.tprint("error during call of purchase.js")
+            }
+        }
+
+        if (getMinFreeMem() > (totalMaxsMem * 0.1)) {
+            if (!findAndUpdateMaxTargetCount(ns, servers)) {
+                if (WEAKEN_THREADS_COMP_MULT < 1.0 && GROW_THREADS_COMP_MULT < 0.5) {
+                    MAX_TOTAL_BATCHES = Math.min(MAX_ALLOWED_BATCH_PER_TARGET, MAX_TOTAL_BATCHES + 1);
+                }
+            }
+        }
+        if (GROW_THREADS_COMP_MULT > 1 || WEAKEN_THREADS_COMP_MULT > 1.5) {
+            MAX_TOTAL_BATCHES = Math.max(MIN_ALLOWED_BATCH_PER_TARGET, MAX_TOTAL_BATCHES - 1);
+        }
+    }
+}
+
+function findAndUpdateMaxTargetCount(ns, hostnames) {
+    // If MAX_TARGET_COUNT is not defined, set it to a default (e.g., 1)
+    if (typeof MAX_TARGET_COUNT === "undefined") {
+        MAX_TARGET_COUNT = 1;
+    }
+
+    // Case 1: If the number of hosts is less than MAX_TARGET_COUNT
+    if (hostnames.length < MAX_TARGET_COUNT) {
+        MAX_TARGET_COUNT += 1;
+        return true;
+    }
+
+    // Case 2: If MAX_TARGET_COUNT is greater than or equal to the number of hosts
+    if (MAX_TARGET_COUNT >= hostnames.length) {
+        return false;
+    }
+
+    // Default: Increase MAX_TARGET_COUNT by 1 and return true
+    MAX_TARGET_COUNT += 1;
+    return true;
 }
